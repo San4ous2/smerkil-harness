@@ -101,6 +101,19 @@ class Agent:
         self.mcp_tools = self.mcp.tool_specs() if self.mcp.servers else []
         self.hooks = HookRunner.load(workspace)
         self.client = LLMClient(config.base_url, config.resolve_api_key())
+
+        # Budget alerts fire before the guardrail trips. Off unless configured
+        # (SMERKIL_ALERT_URL or workspace/alerts.yaml), so nothing changes for
+        # anyone who doesn't ask for it.
+        try:
+            from .alerts import alerts_from_config
+            self.alerts = alerts_from_config(
+                workspace, budget, agent=config.name,
+                run_id=self.trace.get("run_id", ""),
+                verbose=bool(os.environ.get("SMERKIL_ALERT_VERBOSE")))
+        except Exception:
+            self.alerts = None
+
         if compactor is not None:
             self.compactor = compactor
         else:
@@ -214,6 +227,13 @@ class Agent:
                 self.session_budget.record(usage.get("prompt_tokens", 0) or 0,
                                            usage.get("completion_tokens", 0) or 0,
                                            model=served_by)
+
+            if self.alerts is not None:
+                # best-effort; a dead webhook must never kill the run
+                try:
+                    self.alerts.check()
+                except Exception:
+                    pass
 
             choice = resp["choices"][0]
             msg = choice["message"]
