@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -243,9 +245,9 @@ def cmd_push(args: argparse.Namespace) -> int:
     import urllib.error
     import urllib.request
 
-    url = args.url or os.environ.get("SMERKIL_DASHBOARD_URL")
+    url = args.url or os.environ.get("SMERKIL_DASHBOARD_URL") or load_dashboard_session().get("url")
     if not url:
-        print(red("error: no dashboard URL (--url https://… or $SMERKIL_DASHBOARD_URL)"))
+        print(red("error: no dashboard URL (smerkil login, --url https://…, or $SMERKIL_DASHBOARD_URL)"))
         return 2
     if not url.startswith("https://") and not url.startswith("http://"):
         print(red("error: URL must start with http:// or https://"))
@@ -260,7 +262,9 @@ def cmd_push(args: argparse.Namespace) -> int:
             print(red(f"error: cannot read token file: {e}"))
             return 2
     if not token:
-        print(red("error: no dashboard token (--token-file FILE or $SMERKIL_DASHBOARD_TOKEN)"))
+        token = load_dashboard_session().get("token", "")
+    if not token:
+        print(red("error: no dashboard token (smerkil login, --token-file FILE, or $SMERKIL_DASHBOARD_TOKEN)"))
         return 2
 
     # build the same payload `smerkil report --json` prints
@@ -376,6 +380,164 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"{s['prompt_tokens']}p/{s['completion_tokens']}c  "
               f"${s['usd']}  {stop_s}")
     return 0
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    """Sign in to a SMERKIL dashboard and remember the session token.
+
+    Prompts for the password without echoing it, then stores the session
+    token in ~/.smerkil/dashboard.json (0600). Nothing else is persisted —
+    no usage data leaves the machine until you run `smerkil push`.
+    """
+    import getpass
+    import urllib.error
+    import urllib.request
+
+    url = (args.url or os.environ.get("SMERKIL_DASHBOARD_URL") or "").rstrip("/")
+    if not url:
+        print(red("error: no dashboard URL (--url https://… or $SMERKIL_DASHBOARD_URL)"))
+        return 2
+    if not url.startswith(("http://", "https://")):
+        print(red("error: URL must start with http:// or https://"))
+        return 2
+
+    email = args.email or input("email: ").strip()
+    if not email:
+        print(red("error: no email"))
+        return 2
+    password = args.password or getpass.getpass("password: ")
+    if not password:
+        print(red("error: no password"))
+        return 2
+
+    payload = json.dumps({"email": email, "password": password, "mode": "signin"}).encode()
+    req = urllib.request.Request(
+        url + "/api/auth",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": f"smerkil/{__version__}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        print(red(f"login failed ({e.code}): {detail}"))
+        return 1
+    except Exception as e:
+        print(red(f"error: {e}"))
+        return 1
+
+    token = ""
+    # the API returns the token in the body and/or a Set-Cookie header
+    try:
+        body = json.loads(raw)
+        token = body.get("token") or (body.get("session") or {}).get("token") or ""
+    except Exception:
+        body = {}
+    for hdr in (resp.headers.get_all("Set-Cookie") or []):
+        m = re.search(r"smerkil_session=([^;]+)", hdr)
+        if m:
+            token = m.group(1)
+    if not token:
+        print(red("error: server did not return a session token"))
+        return 1
+
+    # URL-decoded so Authorization headers work verbatim
+    token = urllib.parse.unquote(token)
+    path = dashboard_token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "url": url,
+        "email": email,
+        "token": token,
+        "logged_in_at": _utc_now(),
+    }, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    print(green(f"signed in as {email}"))
+    print(dim(f"  token saved to {path} (0600)"))
+    print(dim("  this machine can now push: smerkil push   /   live status via --publish-live"))
+    return 0
+
+
+def dashboard_token_path() -> "Path":
+    """Where `smerkil login` stores the dashboard session token."""
+    from pathlib import Path
+
+    root = Path(os.environ.get("SMERKIL_HOME", Path.home() / ".smerkil"))
+    return root / "dashboard.json"
+
+
+def load_dashboard_session() -> dict:
+    """Read the stored dashboard session, or {} if not logged in."""
+    try:
+        data = json.loads(dashboard_token_path().read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("token"):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def publish_live_loop(url: str, token: str, interval: float, snapshot_fn,
+                      verbose: bool = True) -> "threading.Event":
+    """Background-up-push `/live` to a dashboard every `interval` seconds.
+
+    Returns a stop Event; setting it ends the loop after the current tick.
+    Failures are silent by design — this must never take down a server, but
+    the first failure is reported once so the user isn't left guessing.
+    """
+    import threading
+    import urllib.error
+    import urllib.request
+
+    stop = threading.Event()
+    warned = [False]
+
+    def _once() -> None:
+        snap = json.dumps(snapshot_fn()).encode("utf-8")
+        req = urllib.request.Request(
+            url.rstrip("/") + "/api/live",
+            data=snap,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": f"smerkil/{__version__}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=6.0) as resp:
+            if resp.status >= 300 and not warned[0]:
+                warned[0] = True
+                if verbose:
+                    print(yellow(f"  live publish: {resp.status}"))
+
+    def _loop() -> None:
+        while not stop.is_set():
+            try:
+                _once()
+            except urllib.error.HTTPError as e:
+                if not warned[0]:
+                    warned[0] = True
+                    if verbose:
+                        detail = ""
+                        try:
+                            detail = e.read().decode("utf-8", "replace")[:120]
+                        except Exception:
+                            pass
+                        print(yellow(f"  live publish: {e.code} {detail}"))
+            except Exception as e:
+                if not warned[0]:
+                    warned[0] = True
+                    if verbose:
+                        print(yellow(f"  live publish: {e}"))
+            stop.wait(interval)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return stop
 
 
 class _ArgsProxy:
@@ -685,6 +847,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print(dim(f"  auth: {'bearer token' if token else 'open (no token set)'}   "
               f"sessions: /sessions   health: /health   live: /live"))
     print(dim(f"  pid {os.getpid()} · status via: smerkil status"))
+
+    # Optional uplink: POST /live up to the dashboard every few seconds, so
+    # the hosted Console shows this machine even though no browser can reach
+    # localhost. Off unless asked for; failures never kill the server.
+    up_url = args.publish_live or os.environ.get("SMERKIL_PUBLISH_LIVE", "")
+    up_stop = None
+    if up_url:
+        sess = load_dashboard_session()
+        up_token = args.publish_token or os.environ.get("SMERKIL_DASHBOARD_TOKEN", "") \
+            or sess.get("token", "")
+        up_url_final = up_url if up_url.startswith(("http://", "https://")) \
+            else (sess.get("url", ""))
+        if not up_token or not up_url_final:
+            print(yellow("  --publish-live ignored: not logged in (run: smerkil login)"))
+        else:
+            store = httpd.smerkil_store
+            up_stop = publish_live_loop(up_url_final, up_token,
+                                        args.publish_interval, store.live)
+            print(dim(f"  live status → {up_url_final} every {args.publish_interval}s"))
+
     print(dim("Ctrl-C to stop"))
     try:
         httpd.serve_forever()
@@ -692,6 +874,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print(dim("\nserver stopped"))
     finally:
         stop.set()
+        if up_stop:
+            up_stop.set()
         httpd.server_close()
     return 0
 
@@ -826,6 +1010,14 @@ def main() -> int:
     p_push.add_argument("--timeout", type=float, default=20.0)
     p_push.set_defaults(fn=cmd_push)
 
+    p_login = sub.add_parser("login", help="sign in to a dashboard and store the session token")
+    p_login.add_argument("--url", default=None)
+    p_login.add_argument("--email", default=None, help="prompted if omitted")
+    p_login.add_argument("--password", default=None,
+                         help="prompted without echo if omitted (prefer leaving it out)")
+    p_login.add_argument("--timeout", type=float, default=15.0)
+    p_login.set_defaults(fn=cmd_login)
+
     p_status = sub.add_parser("status", help="live status of a running 'smerkil serve'")
     p_status.add_argument("--url", default=None, help="override the discovered server URL")
     p_status.add_argument("--token", default=None, help="bearer token, if the server was started with one")
@@ -840,7 +1032,14 @@ def main() -> int:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8317)
     p_serve.add_argument("--token", default=None,
-                         help="require 'Authorization: Bearer <token>' (or set SMERKIL_SERVE_TOKEN)")
+                         help="require this bearer token (or $SMERKIL_SERVE_TOKEN)")
+    p_serve.add_argument("--publish-live", default=None, nargs="?", const="1",
+                         help="push /live snapshots to the logged-in dashboard so the "
+                              "hosted Console can see this machine")
+    p_serve.add_argument("--publish-token", default=None,
+                         help="dashboard token for --publish-live (default: from smerkil login)")
+    p_serve.add_argument("--publish-interval", type=float, default=5.0,
+                         help="how often to push a live snapshot, in seconds")
     p_serve.set_defaults(fn=cmd_serve)
 
     args = parser.parse_args()

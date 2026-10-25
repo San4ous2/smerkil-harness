@@ -61,6 +61,7 @@ smerkil trace my-agent --show <run-id>
 | `smerkil run <name> --goal "..."` | Run one goal; exit 0 only on completed run |
 | `smerkil chat <name>` | Streaming REPL: live text + tool args, session budget, `/reset`, `/tokens`, `/exit` |
 | `smerkil serve <name>` | HTTP API: `POST /v1/chat`, `GET /sessions`, `GET /health`, `GET /live`; `--host`, `--port`, `--token` |
+| `smerkil login` | sign in to a dashboard; stores the session token in `~/.smerkil/dashboard.json` (0600) |
 | `smerkil status` | live status of a running server — active runs, sessions, budgets; `--url`, `--token`, `--json`, `--max-age` |
 | `smerkil push` | upload `smerkil report --json` to a dashboard; `--url`, `--token-file` (opt-in) |
 | `smerkil eval <name> [-v]` | Run eval scenarios; non-zero exit on regression |
@@ -118,6 +119,23 @@ smerkil status --json | jq '.active_runs'
 
 A heartbeat older than `--max-age` (default 20s), or one whose pid is gone, is
 treated as "not running" — a crashed server can't masquerade as live.
+
+### Seeing it from a hosted dashboard
+
+Your machine is behind NAT; a hosted page can't open a socket to it. So the
+direction is inverted — the harness pushes its status *up*, and the dashboard
+just reads it:
+
+```bash
+smerkil login --url https://smerkil-web.vercel.app      # once, password not echoed
+smerkil serve coder --publish-live                       # then every ~5s
+```
+
+`POST /api/live` carries the same snapshot `GET /live` returns. A snapshot
+older than 45s means the server stopped pushing, so the dashboard reports it
+as offline rather than showing a stale "running". Everything is opt-in:
+without `--publish-live` nothing leaves the machine. `smerkil push` and
+`smerkil status` reuse the token from `login`, so it only has to be typed once.
 
 ## Configuration (agent.yaml)
 
