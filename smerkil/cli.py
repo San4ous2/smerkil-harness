@@ -235,6 +235,144 @@ def cmd_trace(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Replay a saved trace: turn-by-turn model output, tool calls, tokens.
+
+    Reads the per-run JSON or runs.jsonl produced by `smerkil run` and prints
+    what happened, in order. `--tools-only` skips model prose, `--json` emits
+    the raw trace, `-q/--quiet` prints just the final answer.
+    """
+    d = _agent_dir(args.name)
+    traces = _trace_dir(d)
+    if traces is None:
+        print(red("no traces yet for this agent"))
+        return 1
+
+    # locate the run: explicit id, or most recent
+    target = None
+    if args.run:
+        rid = args.run.replace("run-", "").replace(".json", "")
+        for p in sorted(traces.glob("run-*.json")):
+            if rid in p.name:
+                target = p
+                break
+        if target is None:
+            # maybe it's in runs.jsonl
+            rec = _find_run_in_jsonl(traces, args.run)
+            if rec is None:
+                print(red(f"no trace matching '{args.run}'"))
+                return 1
+            trace = rec
+        else:
+            trace = json.loads(target.read_text(encoding="utf-8"))
+    else:
+        files = sorted(traces.glob("run-*.json"))
+        if not files:
+            print(red("no traces yet"))
+            return 1
+        target = files[-1]
+        trace = json.loads(target.read_text(encoding="utf-8"))
+
+    if args.json:
+        print(json.dumps(trace, indent=2))
+        return 0
+
+    if args.quiet:
+        print(trace.get("final") or "")
+        return 0
+
+    steps = trace.get("steps") or []
+    tool_calls = trace.get("tool_calls") or []
+    budget = trace.get("budget") or {}
+    totals = trace.get("totals") or {}
+
+    print(bold(f"replay {trace.get('run_id') or (target.name if target else 'run')}"))
+    print(dim(f"  agent {trace.get('agent','?')} · model {trace.get('model','?')}"))
+    if trace.get("started_at"):
+        print(dim(f"  started {trace['started_at']}"))
+    print()
+
+    if not steps and not tool_calls:
+        print(dim("  (empty trace — no recorded turns)"))
+    # merge by turn so tools appear where they happened
+    by_turn = {}
+    for tc in tool_calls:
+        by_turn.setdefault(tc.get("turn", 0), []).append(tc)
+
+    for st in steps:
+        turn = st.get("turn", 0)
+        toks = st.get("tokens") or {}
+        head = f"  turn {turn}"
+        p, c = toks.get("prompt", 0), toks.get("completion", 0)
+        if p or c:
+            head += f"  {p}p/{c}c"
+        if st.get("finish_reason"):
+            head += f"  {st['finish_reason']}"
+        print(dim(head))
+        content = (st.get("content") or "").strip()
+        if content and not args.tools_only:
+            for line in content.splitlines():
+                print(f"    {line}")
+        for tc in by_turn.get(turn, []):
+            name = tc.get("name", "?")
+            args_s = (tc.get("args") or "").strip()
+            if len(args_s) > 160:
+                args_s = args_s[:160] + "…"
+            print(f"    {yellow('→')} {green(name)}({args_s})")
+            res = (tc.get("result") or "").strip()
+            if args.verbose and res:
+                for line in res.splitlines()[:8]:
+                    print(dim(f"      {line}"))
+        print()
+
+    # anything not in steps (shouldn't happen, but don't lose data)
+    seen = set()
+    for st in steps:
+        seen.add(st.get("turn", 0))
+    orphan = [t for t, v in by_turn.items() if t not in seen]
+    for t in sorted(orphan):
+        print(dim(f"  turn {t}"))
+        for tc in by_turn[t]:
+            print(f"    {yellow('→')} {green(tc.get('name','?'))}")
+
+    final = (trace.get("final") or "").strip()
+    if final and not args.tools_only:
+        print(bold("final"))
+        for line in final.splitlines():
+            print(f"  {line}")
+        print()
+
+    reason = trace.get("stop_reason") or "?"
+    rcolor = green(reason) if reason == "completed" else yellow(reason)
+    print(f"  stop {rcolor}")
+    print(dim(f"  turns {totals.get('turns', len(steps))} · "
+              f"tool calls {totals.get('tool_calls', len(tool_calls))} · "
+              f"{budget.get('prompt_tokens',0)}p/{budget.get('completion_tokens',0)}c · "
+              f"${budget.get('usd',0):.4f}"))
+    if trace.get("compactions"):
+        print(dim(f"  compactions {trace['compactions']}"))
+    return 0
+
+
+def _find_run_in_jsonl(traces: "Path", run_id: str):
+    """Look up a run inside runs.jsonl by run_id prefix."""
+    f = traces / "runs.jsonl"
+    if not f.exists():
+        return None
+    needle = run_id.replace("run-", "").replace(".json", "")
+    for line in f.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if needle in str(rec.get("run_id", "")):
+            return rec
+    return None
+
+
 def cmd_push(args: argparse.Namespace) -> int:
     """Push this machine's usage report to a SMERKIL dashboard.
 
@@ -1009,6 +1147,19 @@ def main() -> int:
     p_push.add_argument("--limit", type=int, default=20)
     p_push.add_argument("--timeout", type=float, default=20.0)
     p_push.set_defaults(fn=cmd_push)
+
+    p_replay = sub.add_parser("replay", help="replay a saved trace turn by turn")
+    p_replay.add_argument("name")
+    p_replay.add_argument("run", nargs="?", default=None,
+                          help="run id or file name (default: most recent)")
+    p_replay.add_argument("--tools-only", action="store_true",
+                          help="show tool calls only, skip model prose")
+    p_replay.add_argument("--json", action="store_true", help="emit the raw trace")
+    p_replay.add_argument("-q", "--quiet", action="store_true",
+                          help="print only the final answer")
+    p_replay.add_argument("-v", "--verbose", action="store_true",
+                          help="also show tool results")
+    p_replay.set_defaults(fn=cmd_replay)
 
     p_login = sub.add_parser("login", help="sign in to a dashboard and store the session token")
     p_login.add_argument("--url", default=None)
