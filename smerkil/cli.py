@@ -233,6 +233,89 @@ def cmd_trace(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_push(args: argparse.Namespace) -> int:
+    """Push this machine's usage report to a SMERKIL dashboard.
+
+    Entirely opt-in and explicit: nothing is sent unless the user runs this
+    with a target URL. The bearer token is read from a file or env var, never
+    accepted on the command line (argv is world-readable via /proc).
+    """
+    import urllib.error
+    import urllib.request
+
+    url = args.url or os.environ.get("SMERKIL_DASHBOARD_URL")
+    if not url:
+        print(red("error: no dashboard URL (--url https://… or $SMERKIL_DASHBOARD_URL)"))
+        return 2
+    if not url.startswith("https://") and not url.startswith("http://"):
+        print(red("error: URL must start with http:// or https://"))
+        return 2
+
+    # token: --token-file > env; never a bare --token flag
+    token = os.environ.get("SMERKIL_DASHBOARD_TOKEN", "")
+    if args.token_file:
+        try:
+            token = Path(args.token_file).read_text(encoding="utf-8").strip()
+        except OSError as e:
+            print(red(f"error: cannot read token file: {e}"))
+            return 2
+    if not token:
+        print(red("error: no dashboard token (--token-file FILE or $SMERKIL_DASHBOARD_TOKEN)"))
+        return 2
+
+    # build the same payload `smerkil report --json` prints
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_report(_ArgsProxy(name=args.name, json=True, all=True, limit=args.limit))
+    if rc != 0:
+        return rc
+    payload = buf.getvalue().encode("utf-8")
+
+    endpoint = url.rstrip("/") + "/api/usage"
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": f"smerkil/{__version__}",
+        },
+    )
+    print(f"pushing {len(payload)} bytes → {dim(endpoint)}")
+    try:
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            if 200 <= resp.status < 300:
+                print(green(f"ok ({resp.status})"))
+                try:
+                    info = json.loads(body)
+                    if isinstance(info, dict):
+                        print(dim(f"  agents {info.get('agents')}  history {info.get('history')}"))
+                except Exception:
+                    pass
+                return 0
+            print(red(f"failed ({resp.status}): {body[:300]}"))
+            return 1
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        print(red(f"failed ({e.code}): {detail}"))
+        return 1
+    except Exception as e:
+        print(red(f"error: {e}"))
+        return 1
+
+
+class _ArgsProxy:
+    """Minimal stand-in for argparse.Namespace when calling cmd_report."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     """Print a machine-readable usage report across all agents (or one).
 
@@ -659,6 +742,15 @@ def main() -> int:
     p_rep.add_argument("--all", action="store_true", help="include agents with no traces")
     p_rep.add_argument("--limit", type=int, default=20, help="recent runs per agent")
     p_rep.set_defaults(fn=cmd_report)
+
+    p_push = sub.add_parser("push", help="send this machine's usage report to a dashboard")
+    p_push.add_argument("name", nargs="?", default=None)
+    p_push.add_argument("--url", default=None, help="dashboard base URL (or $SMERKIL_DASHBOARD_URL)")
+    p_push.add_argument("--token-file", default=None,
+                        help="file containing the dashboard token (never passed as a flag)")
+    p_push.add_argument("--limit", type=int, default=20)
+    p_push.add_argument("--timeout", type=float, default=20.0)
+    p_push.set_defaults(fn=cmd_push)
 
     p_serve = sub.add_parser("serve", help="serve an agent over HTTP API")
     p_serve.add_argument("name")
