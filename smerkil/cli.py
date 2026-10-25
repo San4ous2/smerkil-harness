@@ -7,6 +7,7 @@ import os
 import sys
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 from . import __version__
 from .agent import Agent
@@ -230,6 +231,170 @@ def cmd_trace(args: argparse.Namespace) -> int:
         print(f"{f.name}  {color:18}  {budget.get('prompt_tokens', 0)}p/"
               f"{budget.get('completion_tokens', 0)}c  ${budget.get('usd', 0)}")
     return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Print a machine-readable usage report across all agents (or one).
+
+    Walks ~/.smerkil/agents/*/workspace/traces/runs.jsonl and aggregates
+    totals per agent: runs, tokens, cost, tools, stop reasons. With --json
+    emits a single JSON document; otherwise a compact colored table.
+    This is the payload the SMERKIL dashboard ingests.
+    """
+    agents_root = Path(os.environ.get("SMERKIL_HOME", Path.home() / ".smerkil")) / "agents"
+    names: list[Path] = []
+    if getattr(args, "name", None):
+        d = _agent_dir(args.name)
+        if d.exists():
+            names = [d]
+    elif agents_root.exists():
+        names = [p for p in sorted(agents_root.iterdir()) if p.is_dir()]
+
+    agents_out: list[dict] = []
+    for d in names:
+        runs = _load_trace_records(d)
+        if not runs and not getattr(args, "all", False):
+            continue
+        agents_out.append(_aggregate_agent(d.name, runs, limit=args.limit))
+
+    payload = {
+        "version": __version__,
+        "generated_at": _utc_now(),
+        "agents": agents_out,
+        "totals": _sum_totals(agents_out),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    _print_report(payload)
+    return 0
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _trace_dir(agent_dir: Path) -> Optional[Path]:
+    """Traces live at <agent>/workspace/traces in current scaffolds, but older
+    layouts kept them at <agent>/traces. Accept either."""
+    for cand in (agent_dir / "workspace" / "traces", agent_dir / "traces"):
+        if cand.exists():
+            return cand
+    return None
+
+
+def _load_trace_records(agent_dir: Path) -> list[dict]:
+    """Merge per-run JSON files and the appended JSONL stream, newest last."""
+    traces = _trace_dir(agent_dir)
+    if traces is None:
+        return []
+    seen: dict[str, dict] = {}
+    for f in sorted(traces.glob("run-*.json")):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        seen[f.name] = rec
+    jsonl = traces / "runs.jsonl"
+    if jsonl.exists():
+        for line in jsonl.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            run_id = str(rec.get("run_id") or "")
+            key = f"run-{run_id}.json" if run_id else f"jsonl-{len(seen)}"
+            if key in seen:
+                seen[key].update(rec)
+            else:
+                seen[key] = rec
+    return list(seen.values())
+
+
+def _aggregate_agent(name: str, runs: list[dict], limit: int = 20) -> dict:
+    runs = sorted(runs, key=lambda r: str(r.get("finished_at") or r.get("started_at") or ""))
+    recent = runs[-limit:]
+    tools: dict[str, int] = {}
+    stops: dict[str, int] = {}
+    prompt = completion = 0
+    usd = 0.0
+    tool_calls = turns = 0
+    for r in runs:
+        prompt += int((r.get("budget") or {}).get("prompt_tokens", 0) or 0)
+        completion += int((r.get("budget") or {}).get("completion_tokens", 0) or 0)
+        usd += float((r.get("budget") or {}).get("usd", 0) or 0)
+        tool_calls += int((r.get("totals") or {}).get("tool_calls", 0) or 0)
+        turns += int((r.get("totals") or {}).get("turns", 0) or 0)
+        stops[str(r.get("stop_reason") or "?")] = stops.get(str(r.get("stop_reason") or "?"), 0) + 1
+        for t in r.get("tool_calls") or []:
+            n = str(t.get("name") or "?") if isinstance(t, dict) else "?"
+            tools[n] = tools.get(n, 0) + 1
+    last = recent[-1] if recent else {}
+    return {
+        "agent": name,
+        "runs": len(runs),
+        "turns": turns,
+        "tool_calls": tool_calls,
+        "budget": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "usd": round(usd, 6),
+        },
+        "stop_reasons": stops,
+        "tools": dict(sorted(tools.items(), key=lambda kv: -kv[1])[:10]),
+        "recent": [
+            {
+                "run_id": r.get("run_id"),
+                "stop_reason": r.get("stop_reason"),
+                "finished_at": r.get("finished_at"),
+                "model": r.get("model"),
+                "prompt_tokens": int((r.get("budget") or {}).get("prompt_tokens", 0) or 0),
+                "completion_tokens": int((r.get("budget") or {}).get("completion_tokens", 0) or 0),
+                "usd": round(float((r.get("budget") or {}).get("usd", 0) or 0), 6),
+                "turns": int((r.get("totals") or {}).get("turns", 0) or 0),
+                "tool_calls": int((r.get("totals") or {}).get("tool_calls", 0) or 0),
+            }
+            for r in reversed(recent)
+        ],
+        "last_run_at": last.get("finished_at") or last.get("started_at"),
+    }
+
+
+def _sum_totals(agents: list[dict]) -> dict:
+    return {
+        "agents": len(agents),
+        "runs": sum(a["runs"] for a in agents),
+        "turns": sum(a["turns"] for a in agents),
+        "tool_calls": sum(a["tool_calls"] for a in agents),
+        "prompt_tokens": sum(a["budget"]["prompt_tokens"] for a in agents),
+        "completion_tokens": sum(a["budget"]["completion_tokens"] for a in agents),
+        "usd": round(sum(a["budget"]["usd"] for a in agents), 6),
+    }
+
+
+def _print_report(payload: dict) -> None:
+    t = payload["totals"]
+    print(bold("SMERKIL usage report") + dim(f"  {payload['generated_at']}"))
+    print(dim(f"  agents {t['agents']}   runs {t['runs']}   turns {t['turns']}   "
+              f"tool calls {t['tool_calls']}"))
+    print(f"  tokens: {t['prompt_tokens']} prompt / {t['completion_tokens']} completion"
+          f"   cost: ${t['usd']}")
+    if not payload["agents"]:
+        print(dim("\n  no agents with traces yet"))
+        return
+    print()
+    for a in payload["agents"]:
+        reason = max(a["stop_reasons"].items(), key=lambda kv: kv[1])[0] if a["stop_reasons"] else "?"
+        color = green(reason) if reason == "completed" else yellow(reason)
+        print(f"  {bold(a['agent']):24} runs {a['runs']:3}  "
+              f"{a['budget']['prompt_tokens']}p/{a['budget']['completion_tokens']}c  "
+              f"${a['budget']['usd']}  {color}")
+        if a["tools"]:
+            print(dim("    tools: " + ", ".join(f"{k}×{v}" for k, v in a["tools"].items())))
 
 
 def _trace_show(traces: Path, show: str) -> int:
@@ -487,6 +652,13 @@ def main() -> int:
     p_doc = sub.add_parser("doctor", help="check env vars, model reachability, workspace health")
     p_doc.add_argument("name", nargs="?", default=None)
     p_doc.set_defaults(fn=cmd_doctor)
+
+    p_rep = sub.add_parser("report", help="aggregate usage across agents (dashboard payload)")
+    p_rep.add_argument("name", nargs="?", default=None)
+    p_rep.add_argument("--json", action="store_true", help="emit a single JSON document")
+    p_rep.add_argument("--all", action="store_true", help="include agents with no traces")
+    p_rep.add_argument("--limit", type=int, default=20, help="recent runs per agent")
+    p_rep.set_defaults(fn=cmd_report)
 
     p_serve = sub.add_parser("serve", help="serve an agent over HTTP API")
     p_serve.add_argument("name")
