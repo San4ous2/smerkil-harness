@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smerkil"
+version = "0.7.5"
+description = "SMERKIL Agent — a production harness for building, evaluating and operating autonomous AI agents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SMERKIL Technologies" }]
+keywords = ["agents", "ai", "harness", "llm", "tool-loop"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+[project.scripts]
+smerkil = "smerkil.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["smerkil*"]
