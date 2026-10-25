@@ -4,7 +4,7 @@ A production harness for building, evaluating and operating autonomous AI agents
 Zero dependencies — stdlib only. Model-agnostic (any OpenAI-compatible endpoint).
 
 ```bash
-pip install smerkil-0.7.5.tar.gz
+pip install smerkil-0.7.6.tar.gz
 
 # scaffold an agent with a role preset
 smerkil new my-agent --role coder   # general|coder|researcher|reviewer|writer
@@ -38,7 +38,9 @@ smerkil trace my-agent --show <run-id>
 - **Tool loop runtime** — deterministic loop, parallel tool execution (a thread pool runs all tool calls from one model turn concurrently, results appended in deterministic order), token & turn budgets, hard stop on runaway loops.
 - **Multi-turn chat** — `Agent.run(goal, history=[...])` records user, assistant and tool turns incrementally; context compaction can never tear a session apart. `smerkil chat` is a streaming REPL (`/reset`, `/tokens`, `/exit`).
 - **Role presets** — `--role coder|researcher|reviewer|writer|general` scaffolds a tuned system prompt and tool set (coder/reviewer get the shell).
-- **HTTP API** — `smerkil serve` exposes the agent over a stdlib HTTP server: `POST /v1/chat` (multi-turn, per-session history + shared session budget), `GET /sessions`, `GET /health`; optional bearer-token auth.
+- **HTTP API** — `smerkil serve` exposes the agent over a stdlib HTTP server: `POST /v1/chat` (multi-turn, per-session history + shared session budget), `GET /sessions`, `GET /health`, `GET /live`; optional bearer-token auth.
+- **Live status** — `smerkil status` finds a running server via its heartbeat file (`~/.smerkil/serve.json`) and reports which sessions are actually executing right now; `--json` for scripting.
+- **Usage report** — `smerkil report` aggregates every agent's on-disk traces into one document (runs, turns, tool calls, tokens, cost, stop reasons, top tools); `smerkil push` sends it to a dashboard, opt-in.
 - **Subagents** — the `subagent` tool spawns isolated child agents with their own context and goal; the child's final answer returns as a tool result. Children cannot spawn further subagents (bounded depth).
 - **Context compaction** — when the transcript exceeds a token budget, older messages are summarized (system prompt and recent window kept verbatim). Summarizers are pluggable (`smerkil.compaction.Summarizer` protocol); the default `TruncatingSummarizer` needs no model, `ModelSummarizer` uses the chat model when `SMERKIL_MODEL_SUMMARIZER=1`.
 - **Streaming** — SSE streaming from any OpenAI-compatible endpoint over stdlib `http.client`: text deltas (`on_token`) and live tool-call argument fragments (`on_tool_delta`); automatic non-streaming fallback when the endpoint doesn't support SSE.
@@ -58,7 +60,9 @@ smerkil trace my-agent --show <run-id>
 | `smerkil new <name> [--role R]` | Scaffold an agent dir with a role preset |
 | `smerkil run <name> --goal "..."` | Run one goal; exit 0 only on completed run |
 | `smerkil chat <name>` | Streaming REPL: live text + tool args, session budget, `/reset`, `/tokens`, `/exit` |
-| `smerkil serve <name>` | HTTP API: `POST /v1/chat`, `GET /sessions`, `GET /health`; `--host`, `--port`, `--token` |
+| `smerkil serve <name>` | HTTP API: `POST /v1/chat`, `GET /sessions`, `GET /health`, `GET /live`; `--host`, `--port`, `--token` |
+| `smerkil status` | live status of a running server — active runs, sessions, budgets; `--url`, `--token`, `--json`, `--max-age` |
+| `smerkil push` | upload `smerkil report --json` to a dashboard; `--url`, `--token-file` (opt-in) |
 | `smerkil eval <name> [-v]` | Run eval scenarios; non-zero exit on regression |
 | `smerkil trace <name> [--show <id>]` | List runs or pretty-print one trace |
 | `smerkil doctor [name]` | Check API key env, endpoint/model reachability, workspace health |
@@ -87,6 +91,33 @@ curl -H "Authorization: Bearer $SERVE_TOKEN" http://127.0.0.1:8317/sessions
 Each `session` id carries its own conversation history and session budget
 (guardrails from `agent.yaml`); runs inside one session are serialized,
 different sessions run concurrently.
+
+### Live status
+
+`smerkil serve` writes a heartbeat to `$SMERKIL_HOME/serve.json` every 5s, so
+`smerkil status` can find it without knowing the port:
+
+```bash
+$ smerkil status
+smerkil status  stub · stub-1
+  pid 619248 · http://127.0.0.1:39567 · up since 2026-10-25T21:13:01+00:00
+  1 running · 3 session(s)
+
+  ○ idle     job-A                runs   1  0p/0c  $0.0  completed
+  ○ idle     job-B                runs   1  0p/0c  $0.0  completed
+  ● running  watch-me             runs   0  0p/0c  $0.0  —
+```
+
+`GET /live` returns the same data as JSON: per-session `in_flight`, `runs`,
+`last_stop_reason` and budget, plus server-wide `active_runs`. Exits non-zero
+when nothing is serving, and `--json` is there for scripts:
+
+```bash
+smerkil status --json | jq '.active_runs'
+```
+
+A heartbeat older than `--max-age` (default 20s), or one whose pid is gone, is
+treated as "not running" — a crashed server can't masquerade as live.
 
 ## Configuration (agent.yaml)
 

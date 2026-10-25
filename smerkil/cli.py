@@ -309,6 +309,75 @@ def cmd_push(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    """Live status of a running `smerkil serve`.
+
+    Finds the server via its heartbeat file, then asks GET /live for what
+    sessions exist and which are actually running right now. Exits non-zero
+    when nothing is serving, so it composes in scripts.
+    """
+    import urllib.error
+    import urllib.request
+
+    from .serve import read_heartbeat
+
+    hb = read_heartbeat(max_age_s=args.max_age)
+    if not hb and not args.url:
+        print(dim("no agent serving (start one with: smerkil serve <name>)"))
+        return 1
+
+    url = (args.url or hb.get("url") or "").rstrip("/")
+    if not url:
+        print(red("error: heartbeat has no url; pass --url"))
+        return 2
+    if not url.startswith(("http://", "https://")):
+        print(red("error: URL must start with http:// or https://"))
+        return 2
+
+    headers = {"User-Agent": f"smerkil/{__version__}"}
+    if args.token:
+        headers["Authorization"] = f"Bearer {args.token}"
+    try:
+        req = urllib.request.Request(url + "/live", headers=headers)
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(red(f"server returned {e.code}"))
+        return 1
+    except Exception as e:
+        print(red(f"error: {e}"))
+        return 1
+
+    if args.json:
+        print(json.dumps({**data, "heartbeat": hb}, indent=2, ensure_ascii=False))
+        return 0
+
+    print(bold(f"smerkil status") + dim(f"  {data.get('agent')} · {data.get('model')}"))
+    if hb:
+        print(dim(f"  pid {hb.get('pid')} · {hb.get('url')} · up since {hb.get('updated_at')}"))
+    active = data.get("active_runs", 0)
+    sessions = data.get("sessions", [])
+    badge = green(f"{active} running") if active else dim("idle")
+    print(f"  {badge} · {len(sessions)} session(s)")
+
+    if not sessions:
+        print(dim("\n  no sessions yet — POST /v1/chat to create one"))
+        return 0
+
+    print()
+    for s in sessions:
+        if s.get("in_flight"):
+            mark = green("● running")
+        else:
+            mark = dim("○ idle   ")
+        stop = s.get("last_stop_reason") or "—"
+        stop_s = dim(stop) if stop in ("completed", None, "—") else yellow(stop)
+        print(f"  {mark}  {bold(s['session']):20} runs {s['runs']:3}  "
+              f"{s['prompt_tokens']}p/{s['completion_tokens']}c  "
+              f"${s['usd']}  {stop_s}")
+    return 0
+
+
 class _ArgsProxy:
     """Minimal stand-in for argparse.Namespace when calling cmd_report."""
 
@@ -602,22 +671,27 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
 # ---------------- serve (HTTP API) ----------------
 def cmd_serve(args: argparse.Namespace) -> int:
-    from .serve import make_server
+    from .serve import make_server, write_heartbeat
     d, cfg = _load(args.name)
     token = args.token or os.environ.get("SMERKIL_SERVE_TOKEN", "")
     httpd = make_server(cfg, d / "workspace", host=args.host, port=args.port,
                         token=token)
     port = httpd.server_address[1]
+    url = f"http://{args.host}:{port}"
+    # publish reachability so `smerkil status` works without knowing the port
+    stop = write_heartbeat(cfg, args.host, port, os.getpid(), url)
     print(bold(f"smerkil serve — {cfg.name} ({cfg.model})"))
-    print(f"  listening on http://{args.host}:{port}/v1/chat")
+    print(f"  listening on {url}/v1/chat")
     print(dim(f"  auth: {'bearer token' if token else 'open (no token set)'}   "
-              f"sessions: /sessions   health: /health"))
+              f"sessions: /sessions   health: /health   live: /live"))
+    print(dim(f"  pid {os.getpid()} · status via: smerkil status"))
     print(dim("Ctrl-C to stop"))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print(dim("\nserver stopped"))
     finally:
+        stop.set()
         httpd.server_close()
     return 0
 
@@ -751,6 +825,15 @@ def main() -> int:
     p_push.add_argument("--limit", type=int, default=20)
     p_push.add_argument("--timeout", type=float, default=20.0)
     p_push.set_defaults(fn=cmd_push)
+
+    p_status = sub.add_parser("status", help="live status of a running 'smerkil serve'")
+    p_status.add_argument("--url", default=None, help="override the discovered server URL")
+    p_status.add_argument("--token", default=None, help="bearer token, if the server was started with one")
+    p_status.add_argument("--max-age", type=float, default=20.0,
+                          help="ignore a heartbeat older than N seconds")
+    p_status.add_argument("--timeout", type=float, default=5.0)
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(fn=cmd_status)
 
     p_serve = sub.add_parser("serve", help="serve an agent over HTTP API")
     p_serve.add_argument("name")
