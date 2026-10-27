@@ -274,6 +274,100 @@ class GitLog(_GitTool):
         return self._git(["log", "--oneline", f"-n{n}"], repo)[:5000]
 
 
+class GitDiff(_GitTool):
+    name = "git_diff"
+    description = ("Read-only diff of uncommitted changes (or of one commit). "
+                   "args: {staged: bool, commit: str, max_lines}")
+    params = {"type": "object",
+              "properties": {"staged": {"type": "boolean", "description": "diff --cached instead of worktree"},
+                             "commit": {"type": "string", "description": "show diff of this commit (HEAD~1, sha)"},
+                             "max_lines": {"type": "integer", "description": "default 200"}},
+              "required": []}
+
+    def run(self, staged: bool = False, commit: str = "", max_lines: int = 200, **_: Any) -> str:
+        repo = self._repo()
+        if commit:
+            out = self._git(["show", "--stat", "--patch", str(commit)], repo)
+        else:
+            # include untracked files (git diff alone hides them)
+            untracked = self._git(["ls-files", "--others", "--exclude-standard"], repo)
+            out = self._git(["diff", "--patch"] + (["--cached"] if staged else []), repo)
+            if untracked.strip() and not staged:
+                if out.strip():
+                    out += "\n"
+                for f in untracked.splitlines():
+                    try:
+                        content = (repo / f).read_text(encoding="utf-8", errors="replace")[:80]
+                    except OSError:
+                        continue
+                    out += f"\n--- untracked: {f} ---\n+{content}"
+        cap = max(20, min(int(max_lines), 1000))
+        lines = out.splitlines()
+        if len(lines) <= cap:
+            return out or "(no changes)"
+        return "\n".join(lines[:cap]) + f"\n… ({len(lines) - cap} more lines truncated)"
+
+
+class GitCommit(_GitTool):
+    name = "git_commit"
+    description = ("Stage files and create a commit in the repository containing the workspace. "
+                   "args: {message: str (required), add: [paths] or '.' for all, stage_all: bool}")
+    params = {"type": "object",
+              "properties": {"message": {"type": "string", "description": "commit message"},
+                             "add": {"type": "array", "items": {"type": "string"},
+                                     "description": "paths to stage, ['.'] stages everything"},
+                             "stage_all": {"type": "boolean", "description": "same as add:['.']"}},
+              "required": ["message"]}
+
+    def run(self, message: str = "", add: Optional[List[str]] = None,
+            stage_all: bool = False, **_: Any) -> str:
+        if not message or not message.strip():
+            raise ToolError("commit message is required")
+        repo = self._repo()
+        # refuse to commit into an empty repo without any commits history? git allows it; keep allowed.
+        if add or stage_all:
+            paths = ["-A"] if (stage_all or add == ["."]) else [str(a) for a in (add or [])]
+            self._git(["add"] + paths, repo)
+        # sanity: what is actually staged?
+        staged = self._git(["diff", "--cached", "--name-only"], repo)
+        if not staged.strip() and not (add or stage_all):
+            raise ToolError("nothing staged — pass add:['.'] or explicit paths, or changes are already committed")
+        commit_out = self._git(["commit", "-m", message.strip()], repo)
+        sha = ""
+        try:
+            sha = self._git(["rev-parse", "--short", "HEAD"], repo)
+        except ToolError:
+            pass
+        nfiles = len([l for l in staged.splitlines() if l.strip()])
+        return f"committed {sha or '?'} ({nfiles} files staged)\n{commit_out[:400]}"
+
+
+class GitBranch(_GitTool):
+    name = "git_branch"
+    description = ("List branches, create one, or switch. args: {action: 'list'|'create'|'switch', name}")
+    params = {"type": "object",
+              "properties": {"action": {"type": "string", "enum": ["list", "create", "switch"]},
+                             "name": {"type": "string"}},
+              "required": ["action"]}
+
+    def run(self, action: str = "list", name: str = "", **_: Any) -> str:
+        repo = self._repo()
+        if action == "list":
+            return self._git(["branch", "-a"], repo)
+        if not name or not name.strip():
+            raise ToolError(f"{action} requires a branch name")
+        b = name.strip()
+        # sanitize: no spaces/shell metachars — git ref validation
+        import re as _re
+        if not _re.fullmatch(r"[A-Za-z0-9._/-]+", b) or b.startswith("-"):
+            raise ToolError(f"invalid branch name: {b!r}")
+        if action == "create":
+            return self._git(["checkout", "-b", b], repo)
+        if action == "switch":
+            return self._git(["checkout", b], repo)
+        raise ToolError("action must be list | create | switch")
+
+
 # ---------------- new: plan / todo tools ----------------
 class PlanTool(Tool):
     """Backed by a Plan object injected at build time (not the sandbox)."""
@@ -555,8 +649,8 @@ class CheckpointTool(Tool):
 BUILTIN_TOOLS: Dict[str, Callable[[Sandbox, bool], Tool]] = {
     t.name: t
     for t in (ReadFile, WriteFile, ListDir, RunShell, MemoryNote,
-              WebFetch, PythonExec, GitStatus, GitLog, GrepTool, GlobTool,
-              CheckpointTool)
+              WebFetch, PythonExec, GitStatus, GitLog, GitDiff, GitCommit,
+              GitBranch, GrepTool, GlobTool, CheckpointTool)
 }
 
 

@@ -4,7 +4,7 @@ A production harness for building, evaluating and operating autonomous AI agents
 Zero dependencies — stdlib only. Model-agnostic (any OpenAI-compatible endpoint).
 
 ```bash
-pip install smerkil-0.7.6.tar.gz
+curl -fsSL https://smerkil-technologies.vercel.app/install.sh | bash
 
 # scaffold an agent with a role preset
 smerkil new my-agent --role coder   # general|coder|researcher|reviewer|writer
@@ -48,7 +48,7 @@ smerkil trace my-agent --show <run-id>
 - **Failover-aware budget** — cost priced per the model that actually served each turn; chat and serve sessions share one session budget (visible via `/tokens` or `GET /sessions`, enforced mid-session).
 - **Retries & backoff** — exponential backoff with jitter on connection errors and 429/5xx, honoring `Retry-After`.
 - **Structured planning** — `plan_add` / `plan_list` / `plan_update` tools backed by `workspace/plan.md` with `todo` / `in_progress` / `done` statuses.
-- **More tools** — `web_fetch` (stdlib, size/time-limited, text extraction), `python_exec` (snippet in a sandboxed subprocess with timeout), `git_status` / `git_log` (read-only), plus the sandboxed file tools and opt-in whitelisted shell.
+- **More tools** — `web_fetch` (stdlib, size/time-limited, text extraction), `python_exec` (snippet in a sandboxed subprocess with timeout), `git_status` / `git_log` / `git_diff` (read-only), `git_commit` / `git_branch` (write), plus the sandboxed file tools and opt-in whitelisted shell.
 - **Memory & state** — per-agent working memory, durable notes (`memory.md`), carried across runs.
 - **Evals** — scenario suites (`evals.yaml`) with grounded-expectation checks; non-zero exit on regression. Ships role-aware scenarios covering planning and parallel tool calls.
 - **Traces** — every run saved as JSONL (`workspace/traces/runs.jsonl`) plus per-run JSON with metadata: run id, per-step serving model, timestamps, token totals, compaction count. Pretty-print with `smerkil trace <name> --show <id>`.
@@ -137,6 +137,24 @@ as offline rather than showing a stale "running". Everything is opt-in:
 without `--publish-live` nothing leaves the machine. `smerkil push` and
 `smerkil status` reuse the token from `login`, so it only has to be typed once.
 
+### Git workflow tools
+
+The coder role ships with a full read/write git toolset — the agent can
+inspect, stage, commit and branch without shell access:
+
+```yaml
+tools: [git_status, git_log, git_diff, git_commit, git_branch]
+```
+
+- `git_status` — porcelain status of the repo containing the workspace
+- `git_log` — recent commits (`{max_count}`)
+- `git_diff` — uncommitted worktree/staged diff, or `{commit: "HEAD~1"}` for a specific commit; untracked files are shown too
+- `git_commit` — stage and commit in one call: `{message, add: ["."]} `; refuses to run with an empty message or nothing staged
+- `git_branch` — `{action: list|create|switch, name}`; names are validated against git ref rules
+
+Reviewer gets the read-only subset (`git_diff` included) — it can see exactly
+what changed, but cannot mutate history.
+
 ## Configuration (agent.yaml)
 
 ```yaml
@@ -150,7 +168,8 @@ api_key_env: SMERKIL_API_KEY
 system: You are my-agent. Plan, act with tools, verify, answer.
 tools: [read_file, write_file, list_dir, memory_note,
         plan_add, plan_list, plan_update,
-        python_exec, web_fetch, git_status, git_log, subagent]
+        python_exec, web_fetch, git_status, git_log, git_diff,
+        git_commit, git_branch, subagent]
 guardrails:
   max_turns: 40
   budget:
@@ -164,7 +183,7 @@ Existing 0.2.x `agent.yaml` and `evals.yaml` files work unchanged; new tools are
 
 ## Available tools
 
-`read_file`, `write_file`, `list_dir`, `run_shell` (whitelisted, opt-in), `memory_note`, `web_fetch`, `python_exec`, `git_status`, `git_log`, `plan_add`, `plan_list`, `plan_update` (alias: `todo`), `subagent`.
+`read_file`, `write_file`, `list_dir`, `run_shell` (whitelisted, opt-in), `memory_note`, `web_fetch`, `python_exec`, `git_status`, `git_log`, `git_diff`, `git_commit`, `git_branch`, `plan_add`, `plan_list`, `plan_update` (alias: `todo`), `grep`, `glob`, `checkpoint`, `subagent`.
 
 MIT-grade boring infrastructure for probabilistic workers.
 

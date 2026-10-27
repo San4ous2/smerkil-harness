@@ -57,7 +57,7 @@ model: gpt-4o-mini
 # api_key_env: SMERKIL_API_KEY
 system: >
   You are {name}, an autonomous agent. Plan briefly, use tools, verify, answer.
-tools: [read_file, write_file, list_dir, memory_note, plan_add, plan_list, plan_update, python_exec, web_fetch, git_status, git_log, subagent]
+tools: [read_file, write_file, list_dir, memory_note, plan_add, plan_list, plan_update, python_exec, web_fetch, git_status, git_log, git_diff, git_commit, git_branch, subagent]
 guardrails:
   max_turns: 40
   budget:
@@ -80,7 +80,8 @@ ROLE_PRESETS: Dict[str, Dict[str, Any]] = {
         ),
         "tools": ["read_file", "write_file", "list_dir", "grep", "glob",
                   "python_exec", "run_shell", "plan_add", "plan_list",
-                  "plan_update"],
+                  "plan_update", "git_status", "git_log", "git_diff",
+                  "git_commit", "git_branch"],
         "allow_shell": True,
     },
     "researcher": {
@@ -99,7 +100,7 @@ ROLE_PRESETS: Dict[str, Dict[str, Any]] = {
             "references. Verify claims by running code where possible."
         ),
         "tools": ["read_file", "list_dir", "grep", "glob", "python_exec",
-                  "run_shell", "git_status", "git_log"],
+                  "run_shell", "git_status", "git_log", "git_diff"],
         "allow_shell": True,
     },
     "writer": {
