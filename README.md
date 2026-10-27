@@ -48,6 +48,8 @@ smerkil trace my-agent --show <run-id>
 - **Failover-aware budget** — cost priced per the model that actually served each turn; chat and serve sessions share one session budget (visible via `/tokens` or `GET /sessions`, enforced mid-session).
 - **Retries & backoff** — exponential backoff with jitter on connection errors and 429/5xx, honoring `Retry-After`.
 - **Structured planning** — `plan_add` / `plan_list` / `plan_update` tools backed by `workspace/plan.md` with `todo` / `in_progress` / `done` statuses.
+- **Human-in-the-loop confirmations** — `confirm.yaml` flags tools (or arg regexes) that pause the run and ask the human; non-interactive runs fail closed
+- **Durable memory** — `memory_save` / `memory_search` / `memory_forget` persist across sessions in `.smerkil/memory.jsonl`; recent notes are auto-injected into every run's system prompt
 - **More tools** — `web_fetch` (stdlib, size/time-limited, text extraction), `python_exec` (snippet in a sandboxed subprocess with timeout), `git_status` / `git_log` / `git_diff` (read-only), `git_commit` / `git_branch` (write), plus the sandboxed file tools and opt-in whitelisted shell.
 - **Memory & state** — per-agent working memory, durable notes (`memory.md`), carried across runs.
 - **Evals** — scenario suites (`evals.yaml`) with grounded-expectation checks; non-zero exit on regression. Ships role-aware scenarios covering planning and parallel tool calls.
@@ -154,6 +156,42 @@ tools: [git_status, git_log, git_diff, git_commit, git_branch]
 
 Reviewer gets the read-only subset (`git_diff` included) — it can see exactly
 what changed, but cannot mutate history.
+
+### Human-in-the-loop confirmations
+
+Flag tools or argument patterns in `<workspace>/confirm.yaml`:
+
+```yaml
+confirm:
+  tools:
+    - run_shell          # always confirm shell commands
+    - git_commit
+  patterns:              # confirm only matching args
+    - tool: web_fetch
+      match: "https?://internal\\."
+  ask_once_per_run: true # identical repeat calls re-use the approval
+```
+
+The run pauses and prompts on the terminal: `⚠ confirm run_shell({...}) —
+allow? [y/N/a]`. The decision is made by the human, not the model — it can't
+be skipped, faked, or talked out of. Denial returns a structured error to the
+LLM ("denied by human: do not retry"). Non-interactive environments (CI,
+subagents) **fail closed**: the call is denied, not silently allowed.
+Environment switches: `SMERKIL_CONFIRM=1` (all shell), `SMERKIL_CONFIRM_ALL=1`
+(every tool). Inspect what the agent remembers with `smerkil memory <name>`.
+
+### Durable memory across sessions
+
+The agent keeps notes in `<workspace>/.smerkil/memory.jsonl` (survives
+restarts and reinstalls). Three tools, added automatically to every agent:
+
+- `memory_save` — `{text, tags?}`: persist a self-contained fact (capped at 2000 chars)
+- `memory_search` — `{query, limit?}`: keyword retrieval with tag weighting and a recency boost
+- `memory_forget` — `{id}` or `{query}`: delete stale notes
+
+The **8 most recent notes are auto-injected** into every run's system prompt
+(char-capped), so context survives even if the model never calls
+`memory_search`. Old-style `memory.md` keeps working alongside.
 
 ## Configuration (agent.yaml)
 

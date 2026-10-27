@@ -14,6 +14,7 @@ from typing import Optional
 from . import __version__
 from .agent import Agent
 from .config import AgentConfig, load_config_text
+from .memory import MemoryStore
 from .mcp import load_mcp_config
 
 # ---------------- ANSI colors ----------------
@@ -213,6 +214,39 @@ def cmd_eval(args: argparse.Namespace) -> int:
     d, cfg = _load(args.name)
     agent = Agent(cfg, d / "workspace")
     return run_evals(agent, d, verbose=args.verbose)
+
+
+def cmd_memory(args: argparse.Namespace) -> int:
+    """Inspect/search/clear an agent's durable memory (memory.jsonl)."""
+    d, _cfg = _load(args.name)
+    store = MemoryStore(d / "workspace")
+    if args.forget is not None:
+        # --forget VALUE: exact id if a stored entry has it, else treat as query
+        ids = {e["id"] for e in store.recent(10_000)}
+        if args.forget in ids:
+            n = store.forget(entry_id=args.forget)
+        else:
+            n = store.forget(query=args.forget)
+        print(f"forgotten {n} note(s)")
+        return 0
+    if args.search is not None:
+        hits = store.search(args.search, limit=args.limit)
+        if not hits:
+            print(dim("(no matching memories)"))
+            return 0
+        for e in hits:
+            tags = f"  #{' #'.join(e['tags'])}" if e.get("tags") else ""
+            print(f"{e['id']}  {e['ts'][:10]}  {e['text']}{tags}")
+        return 0
+    entries = store.recent(args.limit)
+    if not entries:
+        print(dim("(memory is empty — the agent saves notes via memory_save)"))
+        return 0
+    print(bold(f"durable memory — {args.name} ({len(entries)} shown)"))
+    for e in reversed(entries):  # newest first
+        tags = f"  #{' #'.join(e['tags'])}" if e.get("tags") else ""
+        print(f"{e['id']}  {e['ts'][:10]}  {e['text']}{tags}")
+    return 0
 
 
 def cmd_trace(args: argparse.Namespace) -> int:
@@ -1128,6 +1162,13 @@ def main() -> int:
     p_chat.add_argument("name")
     p_chat.add_argument("--max-turns", type=int, default=8)
     p_chat.set_defaults(fn=cmd_chat)
+
+    p_mem = sub.add_parser("memory", help="inspect an agent's durable memory")
+    p_mem.add_argument("name")
+    p_mem.add_argument("--search", default=None, help="keyword search")
+    p_mem.add_argument("--limit", type=int, default=20)
+    p_mem.add_argument("--forget", default=None, help="forget by id or --search-style query")
+    p_mem.set_defaults(fn=cmd_memory)
 
     p_doc = sub.add_parser("doctor", help="check env vars, model reachability, workspace health")
     p_doc.add_argument("name", nargs="?", default=None)

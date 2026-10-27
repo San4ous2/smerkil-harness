@@ -2,6 +2,6 @@
 
 Zero-dependency core. Model-agnostic. Deterministic tool loop.
 """
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 from .agent import Agent, AgentConfig  # noqa: F401

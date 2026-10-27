@@ -16,8 +16,11 @@ from typing import Any, Callable, Dict, List, Optional
 from .budget import Budget
 from .compaction import Compactor, ModelSummarizer, TruncatingSummarizer
 from .config import AgentConfig
+from .confirm import ConfirmGate, confirm_from_config, confirm_from_env
 from .hooks import HookRunner
 from .llm import LLMClient, LLMError
+from .memory import MemoryStore
+from .memory_tools import MemoryForget, MemorySave, MemorySearch
 from .mcp import MCPManager, load_mcp_config
 from .planning import Plan
 from .skills import SkillTool, load_skills, skills_index
@@ -102,6 +105,25 @@ class Agent:
         self.hooks = HookRunner.load(workspace)
         self.client = LLMClient(config.base_url, config.resolve_api_key())
 
+        # durable memory: append-only JSONL with keyword recall. The three
+        # memory tools are added automatically; recent notes are injected
+        # into the system prompt at run start.
+        self.memory = MemoryStore(workspace)
+        if "memory_save" not in self.tools:
+            self.tools["memory_save"] = MemorySave(self.memory, self.sandbox)
+        if "memory_search" not in self.tools:
+            self.tools["memory_search"] = MemorySearch(self.memory, self.sandbox)
+        if "memory_forget" not in self.tools:
+            self.tools["memory_forget"] = MemoryForget(self.memory, self.sandbox)
+
+        # human-in-the-loop confirmation gate (confirm.yaml / SMERKIL_CONFIRM*)
+        # subagents (depth > 0) never prompt: they inherit "no human attached"
+        # and the parent's gate already ran on the shared calls
+        confirm_policy = None
+        if depth == 0:
+            confirm_policy = confirm_from_config(workspace) or confirm_from_env()
+        self.confirm = ConfirmGate(confirm_policy) if confirm_policy else None
+
         # Budget alerts fire before the guardrail trips. Off unless configured
         # (SMERKIL_ALERT_URL or workspace/alerts.yaml), so nothing changes for
         # anyone who doesn't ask for it.
@@ -185,12 +207,19 @@ class Agent:
             system += todo_block
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
 
-        # durable memory injection
+        # durable memory injection (file-based memory.md still supported,
+        # plus the new structured store shown as recent notes)
         mem_path = self.workspace / "memory.md"
         if mem_path.exists():
             notes = mem_path.read_text(encoding="utf-8").strip()
             if notes:
                 messages.append({"role": "system", "content": f"Durable memory from previous runs:\n{notes}"})
+        mem_block = self.memory.prompt_block()
+        if mem_block:
+            messages.append({"role": "system", "content": mem_block.strip()})
+        if self.confirm is not None:
+            # approvals don't leak across runs
+            self.confirm.policy.reset_run()
 
         if history:
             # chat mode: replay prior turns between system preamble and the new goal
@@ -307,6 +336,12 @@ class Agent:
                          if cid not in blocked and n.startswith("mcp__")]
             builtin_calls = [(cid, n, a) for cid, n, a in triplets
                              if cid not in blocked and not n.startswith("mcp__")]
+            # human-in-the-loop gate: pause before executing flagged calls
+            if self.confirm is not None:
+                for cid, n, a in builtin_calls:
+                    denial = self.confirm.check(n, a)
+                    if denial is not None:
+                        blocked[cid] = denial
             results = execute_tools_parallel(self.tools, builtin_calls)
             for cid, n, a in mcp_calls:
                 try:
