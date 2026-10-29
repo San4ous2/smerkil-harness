@@ -636,6 +636,106 @@ def cmd_login(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pair(args: argparse.Namespace) -> int:
+    """Link this machine to a dashboard with a one-time pairing code.
+
+    No account, no password, no stored credentials on the server side: the
+    harness asks /api/pair for a short-lived code, the human claims it in the
+    browser at /pair?code=…, and the harness picks up a self-contained signed
+    token. Everything after that is Authorization: Bearer <token>.
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    url = (
+        args.url
+        or os.environ.get("SMERKIL_DASHBOARD_URL")
+        or "https://smerkil-technologies.vercel.app"
+    ).rstrip("/")
+
+    try:
+        req = urllib.request.Request(
+            url + "/api/pair",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"smerkil/{__version__}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15.0) as resp:
+            started = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        print(red(f"error: pairing failed: {e}"))
+        return 1
+
+    code = started.get("code") or ""
+    pair_url = started.get("url") or f"{url}/pair?code={code}"
+    if not code:
+        print(red("error: dashboard did not return a pairing code"))
+        return 1
+
+    print(green("Pairing code: ") + f"  {code}")
+    print(dim(f"Open: {pair_url}"))
+    print(dim(f"Waiting up to {int(args.timeout)}s for you to claim it… (Ctrl-C to stop)"))
+
+    deadline = time.time() + float(args.timeout)
+    poll = 2.0
+    token = ""
+    try:
+        while time.time() < deadline:
+            try:
+                preq = urllib.request.Request(
+                    f"{url}/api/pair?code={urllib.parse.quote(code)}",
+                    headers={"User-Agent": f"smerkil/{__version__}"},
+                )
+                with urllib.request.urlopen(preq, timeout=10.0) as resp:
+                    st = json.loads(resp.read().decode("utf-8", "replace"))
+                if st.get("token"):
+                    token = st["token"]
+                    break
+                if st.get("error"):
+                    print(red(f"error: {st.get('error')}"))
+                    return 1
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    print(red("error: pairing code expired — run `smerkil pair` again"))
+                    return 1
+            except Exception:
+                pass  # transient network hiccup: keep waiting
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print(yellow("\ncancelled"))
+        return 130
+
+    if not token:
+        print(red("error: timed out waiting for the code to be claimed"))
+        return 1
+
+    path = dashboard_token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "url": url,
+        "principal": "pair",
+        "token": token,
+        "paired_at": _utc_now(),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+    if args.json:
+        print(json.dumps({"ok": True, "url": url, "principal": "pair"}, indent=2))
+    else:
+        print(green("paired. this machine can now push live status."))
+        print(dim(f"  token saved to {path} (0600)"))
+        print(dim("  try: smerkil serve <name> --publish-live"))
+    return 0
+
+
 def dashboard_token_path() -> "Path":
     """Where `smerkil login` stores the dashboard session token."""
     from pathlib import Path
@@ -1210,6 +1310,18 @@ def main() -> int:
                          help="prompted without echo if omitted (prefer leaving it out)")
     p_login.add_argument("--timeout", type=float, default=15.0)
     p_login.set_defaults(fn=cmd_login)
+
+    p_pair = sub.add_parser(
+        "pair",
+        help="link this machine to a dashboard with a one-time code (no account)",
+    )
+    p_pair.add_argument("--url", default=None,
+                        help="dashboard URL (default: $SMERKIL_DASHBOARD_URL)")
+    p_pair.add_argument("--timeout", type=float, default=600.0,
+                        help="how long to wait for the code to be claimed")
+    p_pair.add_argument("--json", action="store_true",
+                        help="print the pairing result as JSON")
+    p_pair.set_defaults(fn=cmd_pair)
 
     p_status = sub.add_parser("status", help="live status of a running 'smerkil serve'")
     p_status.add_argument("--url", default=None, help="override the discovered server URL")
